@@ -176,44 +176,65 @@ Tarea: Recibir los leads limpios de Apify, calificar sus puntos de dolor de form
 
 ● Definición final en DB: Update leads set status = 'prospectado' where id = {{ $json.lead_id }}.
 
-2. FLUJO: CLOSER AGENT (Gestión de Conversación y
-Cita)
+2. FLUJO: CLOSER AGENT (Gestión Conversacional + Agendamiento)
 
-Objetivo: Guiar al lead hacia la cita mediante una atención estilo "concierge".
+Objetivo: Guiar al lead hacia la cita mediante una atención estilo "concierge", desacoplando la conversación en tiempo real del listener de confirmación de Calendly.
 
-● Precisión Técnica: * Implementación de Manejador de Estados (FSM) en base de
-datos para saber exactamente en qué punto de la venta está el usuario.
-○ Validación de datos estructurados (Zod/JSON Schema) para asegurar que la
-información recolectada sea procesable.
-● Coherencia: Uso de RAG (Retrieval-Augmented Generation) para responder dudas
-sobre precios o procesos basándose exclusivamente en la documentación oficial de
-la agencia.
-● Humanización: Protocolo de "Hand-off" humano. Si la IA detecta sentimientos de
-frustración o una pregunta técnica de alta complejidad, transfiere la charla a un
-humano enviando una alerta prioritaria.
+● Precisión Técnica:
+  * Implementación de Manejador de Estados (FSM) sobre la tabla `leads` para transicionar `prospectado -> conversando -> cita_agendada`.
+  * Uso de salida estructurada en JSON Schema en el nodo LLM para controlar `response_text`, `confidence_score`, `requires_human` y `reason`.
+  * Arquitectura desacoplada en dos workflows independientes (2.A y 2.B), conectados por estado en base de datos y disparo asíncrono al Flujo 4.
+● Coherencia: RAG obligatorio desde `knowledge_base` para responder con contexto técnico, apoyado en memoria conversacional de `agent_memory`.
+● Humanización: Protocolo de hand-off humano cuando la confianza es baja (`confidence_score < 0.6`) o el modelo marca `requires_human = true`.
 
-Tarea: Responder en tiempo real y agendar en Calendly.
+---
+
+### FLUJO 2.A: WHATSAPP CLOSER AGENT (Chatbot + Memoria + RAG)
+
+Tarea: Responder en tiempo real los mensajes entrantes de WhatsApp, mantener contexto conversacional, decidir hand-off y empujar al lead hacia el agendamiento.
 
 ● Instrucciones de Desarrollo:
-1. Webhook Listener y Respuesta Inmediata: Un único entry-point en n8n
-para WhatsApp/Gmail. OBLIGATORIO: Implementar un nodo "Respond to
-Webhook" inmediatamente después del trigger para devolver un HTTP 200
-OK al proveedor. Esto evita reintentos y duplicación de procesos.
-2. Identificación de Contexto: (Procesamiento Asíncrono): Pasar el payload a
-un sub-workflow mediante el nodo "Execute Workflow". Consultar en
-Supabase el lead_id filtrando por el teléfono (remitente de WhatsApp) o email
-(remitente de Gmail). Si no existe en la tabla leads, crearlo. Si existe,
-recuperar los últimos 5 mensajes de la tabla agent_memory y el campo
-personalized_message original.
+1. Webhook Listener con Early ACK: Configurar Webhook `POST` en `/whatsapp/closer-agent` y responder con nodo `Respond to Webhook` (`HTTP 200 OK`) de forma inmediata para evitar reintentos/duplicados de WhatsApp Cloud API.
+2. Normalización del evento: Extraer `phone`, `text`, `name` y descartar eventos sin `messages` (status updates).
+3. Gestión de lead en Supabase:
+   * Buscar lead por `phone`.
+   * Si no existe, crearlo con `status = 'conversando'`.
+   * Si existe, actualizar `status = 'conversando'`.
+4. Contexto para el LLM:
+   * Recuperar últimos 5 mensajes de `agent_memory` por `lead_id`.
+   * Generar embedding del mensaje y ejecutar RPC `match_knowledge` (`match_threshold: 0.7`, `match_count: 3`) sobre `knowledge_base`.
+5. Closer Agent (OpenAI):
+   * Modelo `gpt-4o-mini` (temperature 0.4).
+   * Prompt con: contexto del lead, historial, conocimiento RAG y objetivo de llevar a Calendly.
+   * Salida estricta por JSON Schema con `response_text`, `confidence_score`, `requires_human`, `reason`.
+6. Enrutamiento:
+   * Si `requires_human = true` o `confidence_score < 0.6`, alertar al humano por WhatsApp.
+   * En caso contrario, responder al lead por WhatsApp.
+7. Persistencia y resiliencia:
+   * Guardar en `agent_memory` los turnos `user` y `assistant`.
+   * Registrar fallos en `system_logs` mediante `Error Trigger`.
 
-3. Inyección RAG: Antes de generar la respuesta, realizar una búsqueda
-semántica en la tabla knowledge_base usando el embedding de la
-pregunta del usuario.
-4. Lógica de Agendamiento: Si la intención detectada es "agendar", el agente
-debe presentar el link de Calendly y monitorear el webhook de Calendly para
-marcar el lead como status = 'cita_agendada'.
-5. Human Hand-off: Si el score de confianza del LLM es < 0.6 o detecta
-irritación, disparar alerta a Slack/Discord con el historial.
+---
+
+### FLUJO 2.B: CALENDLY LISTENER & STATUS UPDATER
+
+Tarea: Escuchar `invitee.created` de Calendly y cerrar el ciclo actualizando el estado del lead a `cita_agendada`.
+
+● Instrucciones de Desarrollo:
+1. Webhook Listener de Calendly: Configurar Webhook `POST` en `/calendly/invitee-created` con respuesta inmediata (`HTTP 200`).
+2. Filtro y extracción del evento:
+   * Procesar solo `event = 'invitee.created'`.
+   * Extraer `email`, `name`, `text_reminder_number` (como `phone`) desde `payload`.
+3. Gestión de lead en Supabase:
+   * Buscar por `email`.
+   * Si existe, actualizar a `status = 'cita_agendada'`.
+   * Si no existe, crear lead de emergencia con `email`, `name`, `phone` y `status = 'cita_agendada'`.
+4. Encadenamiento con Pre-Sales Intelligence:
+   * Converger ambas ramas en un `Execute Workflow`.
+   * Llamar al Flujo 4 enviando `lead_id` para iniciar el briefing ejecutivo.
+5. Resiliencia:
+   * Capturar errores con `Error Trigger`.
+   * Registrar en `system_logs` con `workflow_name: 'Flujo 2B - Calendly Listener'`.
 
 3. FLUJO: CONTENT AGENT (Autoridad en Redes)
 

@@ -33,7 +33,7 @@ create table if not exists public.leads (
     website              text,
     rating               numeric,
     cms                  text,
-    status               text default 'nuevo',
+    status               text default 'nuevo' check (status in ('nuevo', 'prospectado', 'conversando', 'cita_agendada')),
     personalized_message text,
     tiene_chatbot        boolean,
     reserva_manual       boolean,
@@ -42,7 +42,7 @@ create table if not exists public.leads (
 );
 
 comment on table  public.leads is 'Prospectos generados y calificados por el Outreach Agent';
-comment on column public.leads.status is 'Estado del lead: nuevo | prospectado | cita_agendada';
+comment on column public.leads.status is 'Estado del lead: nuevo | prospectado | conversando | cita_agendada';
 
 
 -- -----------------------------------------------------------------------------
